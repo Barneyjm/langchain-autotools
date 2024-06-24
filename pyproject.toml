@@ -2,7 +2,7 @@
 name = "langchain-autotools"
 version = "0.0.1"
 description = "Automatic Langchain Tool and Toolkit creation from any Python SDK!"
-authors = ["James Barney <Jamesbarney71@gmail.com>"]
+authors = ["James Barney <james@southendsolutions.com>"]
 license = "MIT"
 readme = "README.md"
 
