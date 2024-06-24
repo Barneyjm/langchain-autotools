@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "langchain-autotools"
+version = "0.0.1"
+description = "Automatic Langchain Tool and Toolkit creation from any Python SDK!"
+authors = ["James Barney <Jamesbarney71@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+packages = [
+    { include = "langchain_autotools" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+langchain = "^0.2.5"
+
+[tool.poetry.group.dev.dependencies]
+langchain = "^0.2.5"
+ruff = "^0.4.10"
+pytest = "^8.2.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
