@@ -1,9 +1,16 @@
-from typing import Any, List, Optional
+import json
+from json import JSONDecodeError
+from typing import Any, Optional, Union
 
-from langchain_core.pydantic_v1 import BaseModel, Extra, root_validator
+# ruff: ignore F811
+from langchain_core.callbacks import (
+    CallbackManagerForToolRun,
+)
 from langchain_core.tools import BaseTool
 
-from tool import AutoTool
+from typing import List
+
+from langchain_core.pydantic_v1 import BaseModel, Extra, root_validator
 
 AUTOTOOL_CRUD_CONTROLS_CREATE = False
 AUTOTOOL_CRUD_CONTROLS_READ = True
@@ -53,6 +60,52 @@ class CrudControls(BaseModel):
         values["delete_list"] = delete_list.split(",")
 
         return values  # type: ignore
+
+
+class AutoTool(BaseTool):
+    """Tool for whatever function is passed into AutoTool."""
+
+    client: Any
+    name: str
+    description: str
+
+    def _run(
+        self,
+        tool_input: Union[str, dict, None] = None,
+        *args: tuple,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+        **kwargs: dict,
+    ) -> str:
+        try:
+            if isinstance(tool_input, dict):
+                params = tool_input
+            elif isinstance(tool_input, str):
+                try:
+                    params = json.loads(tool_input)
+                except JSONDecodeError:
+                    params = {}
+            else:
+                params = {}
+
+            func = getattr(self.client["client"], self.name)
+            result = func(*args, **params, **kwargs)
+            return json.dumps(result, default=str)
+        except AttributeError:
+            return f"Invalid function name: {self.name}"
+
+    async def _arun(
+        self,
+        tool_input: Union[str, dict, None] = None,
+        *args: tuple,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+        **kwargs: dict,
+    ) -> str:
+        return self._run(
+            tool_input,
+            *args,
+            run_manager=run_manager,
+            **kwargs,
+        )
 
 
 class AutoToolWrapper(BaseModel):
