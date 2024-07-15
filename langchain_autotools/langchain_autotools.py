@@ -6,11 +6,13 @@ from typing import Any, Optional, Union
 from langchain_core.callbacks import (
     CallbackManagerForToolRun,
 )
+
+from langchain_core.pydantic_v1 import BaseModel, Extra, root_validator
 from langchain_core.tools import BaseTool
 
 from typing import List
+from collections.abc import Iterator, Iterable
 
-from langchain_core.pydantic_v1 import BaseModel, Extra, root_validator
 
 AUTOTOOL_CRUD_CONTROLS_CREATE = False
 AUTOTOOL_CRUD_CONTROLS_READ = True
@@ -89,6 +91,10 @@ class AutoTool(BaseTool):
 
             func = getattr(self.client["client"], self.name)
             result = func(*args, **params, **kwargs)
+            if isinstance(result, dict):
+                result = result
+            elif isinstance(result, (Iterator, Iterable)) and not isinstance(result, (str, bytes)):
+                result = list(result)
             return json.dumps(result, default=str)
         except AttributeError:
             return f"Invalid function name: {self.name}"
