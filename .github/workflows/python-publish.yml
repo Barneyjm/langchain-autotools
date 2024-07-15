@@ -2,13 +2,15 @@ name: Python package
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "*.*.*"
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Build and publish to pypi
-        uses: JRubics/poetry-publish@v2.0
-        with:
-          pypi_token: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Build
+        run: poetry version ${{ github.ref_name }} && poetry build
+      - name: pypi config
+        run: poetry config pypi-token.pypi ${{ secrets.PYPI_API_TOKEN }}
+      - name: pypi publish
+        run: poetry publish
