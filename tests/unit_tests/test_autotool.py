@@ -32,6 +32,11 @@ class FakeSdk:
         """Confabulates Thing -- example of custom verbs"""
         return self._dummy_return(thing_id)
 
+    def get_things_generator(self, start_id: int, count: int):
+        """Generates multiple Things"""
+        for i in range(count):
+            yield self._dummy_return(start_id + i)
+
     def _dummy_return(self, thing_id: int) -> dict:
         """Hidden, never called directly. Does Things"""
         return {"status": 200, "response": {"id": thing_id}}
@@ -173,6 +178,23 @@ def test_confabulate_thing() -> None:
     else:
         raise ValueError("No matching tool found.")
 
+def test_generate_things() -> None:
+    matching_tool = next(
+        (tool for tool in autotool.operations if tool.name == "get_things_generator"), None
+    )
+    if matching_tool:
+        result = json.loads(matching_tool._run(json.dumps({"start_id": 100, "count": 3})))
+        
+        assert hasattr(result, '__iter__')
+
+        assert len(result) == 3
+
+        for i, thing in enumerate(result):
+            assert isinstance(thing, dict)
+            assert thing["status"] == 200
+            assert thing["response"]["id"] == 100 + i
+    else:
+        raise ValueError("No matching tool found.")
 
 def test_no_hidden_methods() -> None:
     assert not any([op.name.startswith("_") for op in autotool.operations])
