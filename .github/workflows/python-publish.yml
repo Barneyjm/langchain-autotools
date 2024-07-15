@@ -8,6 +8,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
       - name: Build
         run: poetry version ${{ github.ref_name }} && poetry build
       - name: pypi config
