@@ -12,10 +12,10 @@ packages = [
 
 [tool.poetry.dependencies]
 python = "^3.10"
-langchain = "^0.2.5"
+langchain = ">=0.3,<0.4"
 
 [tool.poetry.group.dev.dependencies]
-langchain = "^0.2.5"
+langchain = ">=0.3,<0.4"
 ruff = "^0.4.10"
 pytest = "^8.2.2"
 

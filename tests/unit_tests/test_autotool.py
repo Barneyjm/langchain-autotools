@@ -23,6 +23,10 @@ class FakeSdk:
     def put_thing(self, thing_id: int) -> dict:
         """Puts Thing"""
         return self._dummy_return(thing_id)
+    
+    def update_thing(self, thing_id: int) -> dict:
+        """Updates Thing"""
+        return self._dummy_return(thing_id)
 
     def delete_thing(self, thing_id: int) -> dict:
         """Deletes Thing"""
@@ -47,12 +51,28 @@ crud_controls: CrudControls = CrudControls(
     read=True,
     create=True,
     update=True,
+    update_list=["put_thing", "post_thing", "update_thing"],
     delete=True,
 )
 
 autotool = AutoToolWrapper(
     client=client,
     crud_controls=crud_controls,  # type: ignore
+)
+
+
+list_client = {"client": FakeSdk()}
+list_crud_controls: CrudControls = CrudControls(
+    read=True,
+    read_list= ["get_thing"],
+    create=False,
+    update=False,
+    delete=False,
+)
+
+list_autotool = AutoToolWrapper(
+    client=list_client,
+    crud_controls=list_crud_controls,  # type: ignore
 )
 
 
@@ -73,6 +93,22 @@ def test_get_things_no_input() -> None:
 def test_get_thing() -> None:
     matching_tool = next(
         (tool for tool in autotool.operations if tool.name == "get_thing"), None
+    )
+    if matching_tool:
+        assert (
+            json.loads(matching_tool._run(json.dumps({"thing_id": 123})))["response"][
+                "id"
+            ]
+            == 123
+        )
+    else:
+        raise ValueError("No matching tool found.")
+    
+def test_only_get_thing() -> None:
+    if len(list_autotool.operations) != 1:
+        raise ValueError(f"Too many AutoTools, operations should only have `get_thing`, got: {[tool.name for tool in list_autotool.operations]}.")
+    matching_tool = next(
+        (tool for tool in list_autotool.operations if tool.name == "get_thing"), None
     )
     if matching_tool:
         assert (
@@ -109,6 +145,19 @@ def test_create_thing_kwarg_input() -> None:
     else:
         raise ValueError("No matching tool found.")
 
+def test_update_thing() -> None:
+    matching_tool = next(
+        (tool for tool in autotool.operations if tool.name == "update_thing"), None
+    )
+    if matching_tool:
+        assert (
+            json.loads(matching_tool._run(json.dumps({"thing_id": 123})))["response"][
+                "id"
+            ]
+            == 123
+        )
+    else:
+        raise ValueError("No matching tool found.")
 
 def test_post_thing() -> None:
     matching_tool = next(
@@ -158,7 +207,7 @@ def test_delete_thing() -> None:
 def test_confabulate_thing() -> None:
     """tests example sdk customization"""
     crud_controls = CrudControls(
-        read_list="confabulate",
+        read_list=["confabulate_thing"],
     )
 
     autotool = AutoToolWrapper(

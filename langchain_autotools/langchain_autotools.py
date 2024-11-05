@@ -1,67 +1,108 @@
 import json
+import re
+from fnmatch import fnmatch
 from json import JSONDecodeError
-from typing import Any, Optional, Union
-
-# ruff: ignore F811
-from langchain_core.callbacks import (
-    CallbackManagerForToolRun,
-)
-
-from langchain_core.pydantic_v1 import BaseModel, Extra, root_validator
+from typing import Any, Optional, Union, List, Pattern
+from langchain_core.callbacks import CallbackManagerForToolRun
+from pydantic import BaseModel, ConfigDict, model_validator
 from langchain_core.tools import BaseTool
-
-from typing import List
 from collections.abc import Iterator, Iterable
 
-
+# Default CRUD patterns using regex
 AUTOTOOL_CRUD_CONTROLS_CREATE = False
 AUTOTOOL_CRUD_CONTROLS_READ = True
 AUTOTOOL_CRUD_CONTROLS_UPDATE = False
 AUTOTOOL_CRUD_CONTROLS_DELETE = False
 
-AUTOTOOL_CRUD_CONTROLS_CREATE_LIST = "create"
-AUTOTOOL_CRUD_CONTROLS_READ_LIST = "get,read,list"
-AUTOTOOL_CRUD_CONTROLS_UPDATE_LIST = "update,put,post"
-AUTOTOOL_CRUD_CONTROLS_DELETE_LIST = "delete,destroy,remove"
-
+# Default patterns now support both regex (r"^pattern$") and glob ("pattern*") styles
+AUTOTOOL_CRUD_CONTROLS_CREATE_LIST = [
+    r"^create_[^_]+$",  # regex pattern
+    "create_*",         # glob pattern (disabled by default)
+]
+AUTOTOOL_CRUD_CONTROLS_READ_LIST = [
+    r"^get_[^_]+$",    # regex pattern
+    "get_*",           # glob pattern (disabled by default)
+]
+AUTOTOOL_CRUD_CONTROLS_UPDATE_LIST = [
+    r"^update_[^_]+$", # regex pattern
+    "update_*",        # glob pattern (disabled by default)
+]
+AUTOTOOL_CRUD_CONTROLS_DELETE_LIST = [
+    r"^delete_[^_]+$", # regex pattern
+    "delete_*",        # glob pattern (disabled by default)
+]
 
 class CrudControls(BaseModel):
     create: Optional[bool] = AUTOTOOL_CRUD_CONTROLS_CREATE
-    create_list: Optional[str] = AUTOTOOL_CRUD_CONTROLS_CREATE_LIST
+    create_list: Optional[List[str]] = AUTOTOOL_CRUD_CONTROLS_CREATE_LIST
     read: Optional[bool] = AUTOTOOL_CRUD_CONTROLS_READ
-    read_list: Optional[str] = AUTOTOOL_CRUD_CONTROLS_READ_LIST
+    read_list: Optional[List[str]] = AUTOTOOL_CRUD_CONTROLS_READ_LIST
     update: Optional[bool] = AUTOTOOL_CRUD_CONTROLS_UPDATE
-    update_list: Optional[str] = AUTOTOOL_CRUD_CONTROLS_UPDATE_LIST
+    update_list: Optional[List[str]] = AUTOTOOL_CRUD_CONTROLS_UPDATE_LIST
     delete: Optional[bool] = AUTOTOOL_CRUD_CONTROLS_DELETE
-    delete_list: Optional[str] = AUTOTOOL_CRUD_CONTROLS_DELETE_LIST
+    delete_list: Optional[List[str]] = AUTOTOOL_CRUD_CONTROLS_DELETE_LIST
+    _compiled_patterns: dict[str, List[Pattern]] = {}
 
-    @root_validator
+    @model_validator(mode="before")
     def validate_environment(cls, values: dict) -> "CrudControls":
-        create = values.get("create", AUTOTOOL_CRUD_CONTROLS_CREATE)
-        values["create"] = create
+        for crud_type in ['create', 'read', 'update', 'delete']:
+            values[crud_type] = values.get(crud_type, globals()[f"AUTOTOOL_CRUD_CONTROLS_{crud_type.upper()}"])
+            values[f"{crud_type}_list"] = values.get(f"{crud_type}_list", 
+                globals()[f"AUTOTOOL_CRUD_CONTROLS_{crud_type.upper()}_LIST"])
+        return values
 
-        create_list = values.get("create_list", AUTOTOOL_CRUD_CONTROLS_CREATE_LIST)
-        values["create_list"] = create_list.split(",")
+    def _is_regex_pattern(self, pattern: str) -> bool:
+        """Check if a pattern is a regex pattern (starts with r or contains regex special chars)."""
+        regex_chars = '.^$*+?{}[]|\\()'
+        return pattern.startswith('r"') or pattern.startswith("r'") or any(c in pattern for c in regex_chars)
 
-        read = values.get("read", AUTOTOOL_CRUD_CONTROLS_READ)
-        values["read"] = read
+    def compile_patterns(self) -> None:
+        """Compile regex patterns and store glob patterns for each CRUD operation type."""
+        self._compiled_patterns.clear()
+        
+        for crud_type in ['create', 'read', 'update', 'delete']:
+            pattern_list = getattr(self, f"{crud_type}_list", [])
+            regex_patterns = []
+            glob_patterns = []
+            
+            for pattern in pattern_list:
+                if isinstance(pattern, str):
+                    if self._is_regex_pattern(pattern):
+                        # Strip 'r' prefix and quotes if present
+                        if pattern.startswith('r"') or pattern.startswith("r'"):
+                            pattern = pattern[2:-1]
+                        try:
+                            regex_patterns.append(re.compile(pattern))
+                        except re.error:
+                            # If regex compilation fails, treat as glob pattern
+                            glob_patterns.append(pattern)
+                    else:
+                        glob_patterns.append(pattern)
+            
+            self._compiled_patterns[crud_type] = {
+                'regex': regex_patterns,
+                'glob': glob_patterns
+            }
 
-        read_list = values.get("read_list", AUTOTOOL_CRUD_CONTROLS_READ_LIST)
-        values["read_list"] = read_list.split(",")
-
-        update = values.get("update", AUTOTOOL_CRUD_CONTROLS_UPDATE)
-        values["update"] = update
-
-        update_list = values.get("update_list", AUTOTOOL_CRUD_CONTROLS_UPDATE_LIST)
-        values["update_list"] = update_list.split(",")
-
-        delete = values.get("delete", AUTOTOOL_CRUD_CONTROLS_DELETE)
-        values["delete"] = delete
-
-        delete_list = values.get("delete_list", AUTOTOOL_CRUD_CONTROLS_DELETE_LIST)
-        values["delete_list"] = delete_list.split(",")
-
-        return values  # type: ignore
+    def matches_pattern(self, func_name: str, crud_type: str) -> bool:
+        """Check if a function name matches any pattern (regex or glob) for a given CRUD type."""
+        if not self._compiled_patterns:
+            self.compile_patterns()
+            
+        if not getattr(self, crud_type, False):
+            return False
+            
+        patterns = self._compiled_patterns.get(crud_type, {'regex': [], 'glob': []})
+        
+        # Check regex patterns
+        if any(pattern.match(func_name) for pattern in patterns['regex']):
+            return True
+            
+        # Check glob patterns
+        if any(fnmatch(func_name, pattern) for pattern in patterns['glob']):
+            return True
+            
+        return False
 
 
 class AutoTool(BaseTool):
@@ -113,14 +154,14 @@ class AutoTool(BaseTool):
             **kwargs,
         )
 
-
 class AutoToolWrapper(BaseModel):
     client: Any
     operations: List[AutoTool] = []
     crud_controls: CrudControls = CrudControls()
-
-    class Config:
-        extra = Extra.forbid
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="allow"
+    )
 
     def __init__(self, **data: dict) -> None:
         super().__init__(**data)
@@ -142,34 +183,15 @@ class AutoToolWrapper(BaseModel):
             operation = AutoTool(
                 client=self.client, name=func_name, description=func.__doc__
             )
-            if self.crud_controls:
-                if self.crud_controls.create:
-                    if self.crud_controls.create_list is not None and any(
-                        word.lower() in func_name.lower()
-                        for word in self.crud_controls.create_list
-                    ):
-                        operations.append(operation)
-
-                if self.crud_controls.read:
-                    if self.crud_controls.read_list is not None and any(
-                        word.lower() in func_name.lower()
-                        for word in self.crud_controls.read_list
-                    ):
-                        operations.append(operation)
-
-                if self.crud_controls.update:
-                    if self.crud_controls.update_list is not None and any(
-                        word.lower() in func_name.lower()
-                        for word in self.crud_controls.update_list
-                    ):
-                        operations.append(operation)
-
-                if self.crud_controls.delete:
-                    if self.crud_controls.delete_list is not None and any(
-                        word.lower() in func_name.lower()
-                        for word in self.crud_controls.delete_list
-                    ):
-                        operations.append(operation)
+            
+            # Check if function matches any CRUD pattern
+            should_add = any(
+                self.crud_controls.matches_pattern(func_name, crud_type)
+                for crud_type in ['create', 'read', 'update', 'delete']
+            )
+            
+            if should_add:
+                operations.append(operation)
 
         return operations
 
