@@ -14,6 +14,7 @@ import inspect
 import json
 import re
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from fnmatch import fnmatch
 from json import JSONDecodeError
 from re import Pattern
@@ -276,7 +277,7 @@ class AutoTool(BaseTool):
         args, kwargs = self._coerce_input(args, kwargs)
         result = func(*args, **kwargs)
         if inspect.isawaitable(result):
-            result = asyncio.run(_await(result))
+            result = _run_awaitable(result)
         return self._serialize(result)
 
     async def _arun(
@@ -299,6 +300,22 @@ class AutoTool(BaseTool):
             if inspect.isawaitable(result):
                 result = await result
         return self._serialize(result)
+
+
+def _run_awaitable(awaitable: Any) -> Any:
+    """Resolve an awaitable from synchronous code.
+
+    ``asyncio.run`` refuses to run inside an existing event loop, which is
+    exactly where a synchronous ``invoke`` on an async SDK method tends to be
+    called from. Fall back to a short-lived loop on a worker thread there.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_await(awaitable))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, _await(awaitable)).result()
 
 
 async def _await(awaitable: Any) -> Any:

@@ -18,6 +18,7 @@
 - Default CRUD pattern lists are a single glob per verb (`["get_*"]`, `["create_*"]`, ...)
   rather than a regex/glob pair that overlapped.
 - Packaging moved to PEP 621 metadata; Python 3.10+ is required.
+- Ship a `py.typed` marker so downstream type checkers see the annotations.
 
 ### Fixed
 - Glob patterns are no longer misdetected as regexes. `"get_thing*"` is now matched with
@@ -31,6 +32,9 @@
   gone.
 - An `AttributeError` raised *inside* an SDK call is no longer reported as
   `Invalid function name`; only a genuinely missing method produces that message.
+- A synchronous `invoke` on an async SDK method no longer raises
+  `asyncio.run() cannot be called from a running event loop` when called from
+  inside one.
 
 ### Removed
 - **Breaking:** tools no longer accept a JSON string as their whole payload through the

@@ -29,6 +29,7 @@ Changelog = "https://github.com/Barneyjm/langchain-autotools/blob/main/CHANGELOG
 
 [tool.poetry]
 packages = [{ include = "langchain_autotools" }]
+include = [{ path = "langchain_autotools/py.typed", format = ["sdist", "wheel"] }]
 
 [tool.poetry.group.dev.dependencies]
 langchain = ">=1.0,<2.0"

@@ -316,3 +316,12 @@ def test_tool_converts_to_tool_calling_schema() -> None:
     assert spec["function"]["name"] == "get_thing"
     assert spec["function"]["description"] == "Gets Thing"
     assert spec["function"]["parameters"]["properties"]["thing_id"]["type"] == "integer"
+
+
+def test_async_function_over_sync_interface_inside_loop() -> None:
+    """A sync ``invoke`` on an async SDK method works inside a running loop."""
+
+    async def main() -> str:
+        return tool_named("get_thing_async").invoke({"thing_id": 5})
+
+    assert json.loads(asyncio.run(main()))["response"]["id"] == 5
