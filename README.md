@@ -349,3 +349,18 @@ poetry install
 poetry run pytest
 poetry run ruff check .
 ```
+
+## Releasing
+
+The git tag is the version. Pushing a tag matching `*.*.*` runs the release workflow,
+which does `poetry version $TAG` before building, so `version` in `pyproject.toml` is a
+`0.0.0` placeholder and local builds are always `0.0.0`.
+
+```bash
+# add the release to CHANGELOG.md, then, from an up-to-date main:
+git tag 0.2.0 && git push origin 0.2.0
+```
+
+Use a bare tag (`0.2.0`, not `v0.2.0`) to match the published versions. Note that the
+test workflow runs on pushes to `main` and on pull requests, not on tags -- a tag
+publishes whatever it points at, so tag a commit you have already seen go green.
