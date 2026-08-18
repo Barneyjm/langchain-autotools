@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.0] - 2026-08-18
+## [0.2.0] - 2026-08-18
 
 ### Added
 - **Result truncation.** `max_result_length` caps what a call returns before it reaches
