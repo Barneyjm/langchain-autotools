@@ -1,24 +1,50 @@
-[tool.poetry]
+[project]
 name = "langchain-autotools"
-version = "0.0.1"
-description = "Automatic Langchain Tool and Toolkit creation from any Python SDK!"
-authors = ["James Barney <james@southendsolutions.com>"]
+version = "0.1.0"
+description = "Automatic LangChain Tool and Toolkit creation from any Python SDK!"
+authors = [{ name = "James Barney", email = "james@southendsolutions.com" }]
 license = "MIT"
 readme = "README.md"
-
-packages = [
-    { include = "langchain_autotools" },
+requires-python = ">=3.10,<4.0"
+keywords = ["langchain", "tools", "toolkit", "agents", "sdk", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "langchain-core>=1.0,<2.0",
+    "pydantic>=2.7,<3.0",
 ]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-langchain = ">=0.3,<0.4"
+[project.urls]
+Homepage = "https://github.com/Barneyjm/langchain-autotools"
+Repository = "https://github.com/Barneyjm/langchain-autotools"
+Changelog = "https://github.com/Barneyjm/langchain-autotools/blob/main/CHANGELOG.md"
+
+[tool.poetry]
+packages = [{ include = "langchain_autotools" }]
 
 [tool.poetry.group.dev.dependencies]
-langchain = ">=0.3,<0.4"
-ruff = "^0.4.10"
-pytest = "^8.2.2"
+langchain = ">=1.0,<2.0"
+ruff = ">=0.14,<0.15"
+pytest = ">=8.3,<9.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.0"]
 build-backend = "poetry.core.masonry.api"
