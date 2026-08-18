@@ -15,7 +15,9 @@
   `metadata["sdk_function"]`, so destructive operations can be routed to
   `HumanInTheLoopMiddleware` or an approval gate without re-deriving the match.
 - **Name prefixes.** `prefix` renames tools so two wrapped SDKs don't both expose
-  `get_object`; dispatch still uses the underlying method name.
+  `get_object`; dispatch still uses the underlying method name. Validated at
+  construction against the characters providers allow in a tool name, so `prefix="s3."`
+  fails immediately rather than producing tools a model cannot call.
 - **Argument documentation.** Per-parameter docstring text (Google `Args:` blocks and
   Sphinx `:param name:`) becomes the schema field's description, and survives
   `describe="summary"`.

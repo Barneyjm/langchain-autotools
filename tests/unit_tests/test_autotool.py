@@ -695,3 +695,32 @@ def test_arg_docs_survive_summarised_descriptions() -> None:
     toolkit = AutoToolWrapper(client=DocumentedSdk(), describe="summary")
     assert tool_named("get_google", toolkit).description == "Gets a thing."
     assert _properties(toolkit, "get_google")["thing_id"]["description"]
+
+
+# --- prefix validation -----------------------------------------------------
+
+
+@pytest.mark.parametrize("prefix", ["", "s3_", "s3-", "S3", "v2_"])
+def test_valid_prefixes_are_accepted(prefix: str) -> None:
+    toolkit = AutoToolWrapper(client=FakeSdk(), prefix=prefix)
+    assert all(tool.name.startswith(prefix) for tool in toolkit.get_tools())
+
+
+@pytest.mark.parametrize("prefix", ["s3.", "my sdk:", "café_", "s3/", "a:b"])
+def test_invalid_prefixes_are_rejected(prefix: str) -> None:
+    """Fail at construction rather than at inference, where it is unrecoverable."""
+    with pytest.raises(ValidationError):
+        AutoToolWrapper(client=FakeSdk(), prefix=prefix)
+
+
+def test_prefix_error_names_the_problem_and_a_fix() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        AutoToolWrapper(client=FakeSdk(), prefix="s3.")
+    message = str(excinfo.value)
+    assert "'.'" in message
+    assert "'s3_'" in message  # the suggested replacement
+
+
+def test_from_client_validates_its_prefix() -> None:
+    with pytest.raises(ValueError, match="not allowed in a tool name"):
+        AutoTool.from_client(FakeSdk(), "get_thing", prefix="s3.")

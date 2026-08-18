@@ -32,6 +32,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     create_model,
+    field_validator,
     model_validator,
 )
 
@@ -61,6 +62,9 @@ AUTOTOOL_CRUD_CONTROLS_DELETE_LIST = ["delete_*"]
 # Characters that only mean something in a regex -- glob patterns use
 # ``*``, ``?`` and ``[...]``, which are deliberately absent from this set.
 _REGEX_ONLY_CHARS = frozenset(r".^$+{}|\()")
+
+# Characters model providers accept in a tool name.
+_TOOL_NAME_CHARS = re.compile(r"^[a-zA-Z0-9_-]*$")
 
 # Parameters that are part of the calling convention rather than the SDK call.
 _FILTERED_PARAMS = frozenset({"self", "cls", "run_manager", "callbacks"})
@@ -174,6 +178,23 @@ class CrudControls(BaseModel):
     def allows(self, func_name: str) -> bool:
         """Return ``True`` if ``func_name`` matches an enabled verb and no veto."""
         return self.matched_verb(func_name) is not None
+
+
+def _validate_prefix(prefix: str) -> str:
+    """Reject a prefix that would produce a tool name providers won't accept.
+
+    Tool names are limited to letters, digits, underscores and hyphens. A
+    plausible-looking ``"s3."`` yields ``"s3.get_object"``, which the model
+    never gets the chance to call -- better to fail here than at inference.
+    """
+    if not _TOOL_NAME_CHARS.match(prefix):
+        rejected = "".join(sorted({c for c in prefix if not _TOOL_NAME_CHARS.match(c)}))
+        raise ValueError(
+            f"prefix {prefix!r} contains {rejected!r}, which is not allowed in a "
+            "tool name. Use letters, digits, underscores or hyphens -- for "
+            f"example {re.sub(r'[^a-zA-Z0-9_-]', '_', prefix)!r}."
+        )
+    return prefix
 
 
 def _unwrap_client(client: Any) -> Any:
@@ -404,7 +425,7 @@ class AutoTool(BaseTool):
         )
         return cls(
             client=client,
-            name=f"{prefix}{name}",
+            name=f"{_validate_prefix(prefix)}{name}",
             func_name=name,
             fixed_args=pinned,
             **kwargs,
@@ -602,6 +623,11 @@ class AutoToolWrapper(BaseToolkit):
         if isinstance(values, dict) and "client" in values:
             values = {**values, "client": _unwrap_client(values["client"])}
         return values
+
+    @field_validator("prefix")
+    @classmethod
+    def _check_prefix(cls, prefix: str) -> str:
+        return _validate_prefix(prefix)
 
     def model_post_init(self, __context: Any) -> None:
         if not self.operations:

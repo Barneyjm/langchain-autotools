@@ -281,6 +281,15 @@ gcs_tools = AutoToolWrapper(client=gcs, prefix="gcs_").get_tools()
 agent = create_agent("anthropic:claude-opus-5", s3_tools + gcs_tools)
 ```
 
+Prefixes are validated at construction, since a tool name providers reject is only
+discovered at inference:
+
+```python
+AutoToolWrapper(client=s3, prefix="s3.")
+# ValueError: prefix 's3.' contains '.', which is not allowed in a tool name.
+#             Use letters, digits, underscores or hyphens -- for example 's3_'.
+```
+
 ## Argument documentation
 
 Where a docstring documents its parameters, that text is attached to the matching schema
