@@ -12,22 +12,28 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from fnmatch import fnmatch
 from json import JSONDecodeError
 from re import Pattern
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForToolRun,
     CallbackManagerForToolRun,
 )
-from langchain_core.tools import BaseTool, BaseToolkit
+from langchain_core.tools import BaseTool, BaseToolkit, ToolException
 from pydantic import BaseModel, ConfigDict, PrivateAttr, create_model, model_validator
 
+logger = logging.getLogger(__name__)
+
 CRUD_TYPES = ("create", "read", "update", "delete")
+
+#: How a tool description is built from the wrapped function.
+DescriptionStyle = Literal["full", "summary"]
 
 # Default CRUD toggles: read-only unless the caller opts in.
 AUTOTOOL_CRUD_CONTROLS_CREATE = False
@@ -145,18 +151,58 @@ def _unwrap_client(client: Any) -> Any:
     return client
 
 
-def _describe(func: Any, name: str) -> str:
-    """Build a tool description from the function's docstring or signature."""
-    doc = inspect.getdoc(func)
-    if doc and doc.strip():
-        return doc.strip()
-    try:
-        return f"Call the `{name}` operation with signature {inspect.signature(func)}."
-    except (TypeError, ValueError):
-        return f"Call the `{name}` operation."
+def _first_paragraph(text: str) -> str:
+    """Return the leading paragraph of a docstring, collapsed onto one line."""
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line.strip())
+    return " ".join(lines)
 
 
-def _build_args_schema(func: Any, name: str) -> type[BaseModel] | None:
+def _describe(
+    func: Any,
+    name: str,
+    *,
+    style: DescriptionStyle | Callable[[Any, str], str] = "full",
+    max_length: int | None = None,
+    may_shorten: bool = True,
+) -> str:
+    """Build a tool description from the wrapped function.
+
+    ``style`` is ``"full"`` (the whole docstring), ``"summary"`` (its leading
+    paragraph), or a callable taking ``(func, name)``. ``may_shorten`` is
+    ``False`` for functions whose arguments could not be introspected -- their
+    docstring is the only record of what they accept, so ``"summary"`` is
+    skipped for them. An explicit ``max_length`` is always honoured, and a
+    callable is always applied: both are a deliberate instruction.
+    """
+    if callable(style):
+        description = style(func, name)
+    else:
+        doc = inspect.getdoc(func)
+        if doc and doc.strip():
+            description = doc.strip()
+            if style == "summary" and may_shorten:
+                description = _first_paragraph(description) or description
+        else:
+            try:
+                signature = inspect.signature(func)
+                description = f"Call the `{name}` operation with signature {signature}."
+            except (TypeError, ValueError):
+                description = f"Call the `{name}` operation."
+
+    if max_length is not None and len(description) > max_length:
+        description = description[:max_length].rstrip() + "..."
+    return description
+
+
+def _build_args_schema(
+    func: Any, name: str, exclude: Iterable[str] = ()
+) -> type[BaseModel] | None:
     """Derive a pydantic args schema from ``func``'s signature.
 
     Returns ``None`` when the signature cannot be introspected, in which case the
@@ -173,9 +219,10 @@ def _build_args_schema(func: Any, name: str) -> type[BaseModel] | None:
 
     fields: dict[str, tuple[Any, Any]] = {}
     accepts_var_kwargs = False
+    excluded = set(exclude)
 
     for param_name, param in signature.parameters.items():
-        if param_name in _FILTERED_PARAMS:
+        if param_name in _FILTERED_PARAMS or param_name in excluded:
             continue
         if param.kind in (param.VAR_KEYWORD, param.VAR_POSITIONAL):
             # ``**kwargs``/``*args`` mean the real argument list is unknown, so
@@ -207,12 +254,41 @@ def _build_args_schema(func: Any, name: str) -> type[BaseModel] | None:
         return None
 
 
+def _applicable_fixed_args(func: Any, fixed_args: dict[str, Any]) -> dict[str, Any]:
+    """Narrow ``fixed_args`` to the ones ``func`` can actually receive.
+
+    A toolkit-wide pin such as ``{"Bucket": "..."}`` is meaningful only for the
+    operations that take a ``Bucket``; passing it to the others would raise a
+    ``TypeError``. Functions with a ``**kwargs`` catch-all accept everything.
+    """
+    if not fixed_args:
+        return {}
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return dict(fixed_args)
+
+    names = set()
+    for param_name, param in signature.parameters.items():
+        if param.kind is param.VAR_KEYWORD:
+            return dict(fixed_args)
+        if param.kind is not param.VAR_POSITIONAL:
+            names.add(param_name)
+    return {k: v for k, v in fixed_args.items() if k in names}
+
+
 class AutoTool(BaseTool):
     """A ``BaseTool`` bound to a single function on an SDK client."""
 
     client: Any
     name: str
     description: str
+    fixed_args: dict[str, Any] = {}
+    """Arguments pinned by the caller: merged into every call, hidden from the model."""
+
+    # Surface SDK failures to the agent as a tool result rather than ending the
+    # run. Set to False to let the ToolException propagate instead.
+    handle_tool_error: bool | str | Callable[[ToolException], Any] | None = True
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -224,13 +300,34 @@ class AutoTool(BaseTool):
         return values
 
     @classmethod
-    def from_client(cls, client: Any, name: str, **kwargs: Any) -> AutoTool:
+    def from_client(
+        cls,
+        client: Any,
+        name: str,
+        *,
+        fixed_args: dict[str, Any] | None = None,
+        describe: DescriptionStyle | Callable[[Any, str], str] = "full",
+        max_description_length: int | None = None,
+        **kwargs: Any,
+    ) -> AutoTool:
         """Build a tool for ``client.<name>``, inferring schema and description."""
         client = _unwrap_client(client)
         func = getattr(client, name)
-        kwargs.setdefault("description", _describe(func, name))
-        kwargs.setdefault("args_schema", _build_args_schema(func, name))
-        return cls(client=client, name=name, **kwargs)
+        pinned = _applicable_fixed_args(func, fixed_args or {})
+        args_schema = _build_args_schema(func, name, exclude=pinned)
+        kwargs.setdefault("args_schema", args_schema)
+        kwargs.setdefault(
+            "description",
+            _describe(
+                func,
+                name,
+                style=describe,
+                max_length=max_description_length,
+                # Without a schema the docstring is the only argument reference.
+                may_shorten=args_schema is not None,
+            ),
+        )
+        return cls(client=client, name=name, fixed_args=pinned, **kwargs)
 
     @property
     def func(self) -> Any:
@@ -256,50 +353,70 @@ class AutoTool(BaseTool):
         return args, kwargs
 
     @staticmethod
-    def _serialize(result: Any) -> str:
+    def _materialize(result: Any) -> Any:
+        """Drain one-shot results (generators) so they can be read more than once."""
         if isinstance(result, (Iterator, Iterable)) and not isinstance(
             result, (str, bytes, dict)
         ):
-            result = list(result)
-        return json.dumps(result, default=str)
+            return list(result)
+        return result
+
+    def _format(self, result: Any) -> str | tuple[str, Any]:
+        """Render the SDK result per ``response_format``."""
+        result = self._materialize(result)
+        content = json.dumps(result, default=str)
+        if self.response_format == "content_and_artifact":
+            return content, result
+        return content
+
+    def _prepare_call(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        args, kwargs = self._coerce_input(args, kwargs)
+        # Pinned arguments are the caller's, not the model's -- they win.
+        return args, {**kwargs, **self.fixed_args}
 
     def _run(
         self,
         *args: Any,
         run_manager: CallbackManagerForToolRun | None = None,
         **kwargs: Any,
-    ) -> str:
+    ) -> str | tuple[str, Any]:
         try:
             func = self.func
         except AttributeError:
             return f"Invalid function name: {self.name}"
 
-        args, kwargs = self._coerce_input(args, kwargs)
-        result = func(*args, **kwargs)
-        if inspect.isawaitable(result):
-            result = _run_awaitable(result)
-        return self._serialize(result)
+        args, kwargs = self._prepare_call(args, kwargs)
+        try:
+            result = func(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = _run_awaitable(result)
+            return self._format(result)
+        except Exception as exc:
+            raise ToolException(f"{type(exc).__name__}: {exc}") from exc
 
     async def _arun(
         self,
         *args: Any,
         run_manager: AsyncCallbackManagerForToolRun | None = None,
         **kwargs: Any,
-    ) -> str:
+    ) -> str | tuple[str, Any]:
         try:
             func = self.func
         except AttributeError:
             return f"Invalid function name: {self.name}"
 
-        args, kwargs = self._coerce_input(args, kwargs)
-        if inspect.iscoroutinefunction(func):
-            result = await func(*args, **kwargs)
-        else:
-            # Don't block the event loop on a synchronous SDK call.
-            result = await asyncio.to_thread(func, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-        return self._serialize(result)
+        args, kwargs = self._prepare_call(args, kwargs)
+        try:
+            if inspect.iscoroutinefunction(func):
+                result = await func(*args, **kwargs)
+            else:
+                # Don't block the event loop on a synchronous SDK call.
+                result = await asyncio.to_thread(func, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+            return self._format(result)
+        except Exception as exc:
+            raise ToolException(f"{type(exc).__name__}: {exc}") from exc
 
 
 def _run_awaitable(awaitable: Any) -> Any:
@@ -342,6 +459,18 @@ class AutoToolWrapper(BaseToolkit):
     operations: list[AutoTool] = []
     crud_controls: CrudControls = CrudControls()
 
+    fixed_args: dict[str, Any] = {}
+    """Arguments pinned for every operation that accepts them, hidden from the model."""
+
+    describe: DescriptionStyle | Callable[[Any, str], str] = "full"
+    """``"full"``, ``"summary"`` (leading paragraph), or a ``(func, name)`` callable."""
+
+    max_description_length: int | None = None
+    """Hard ceiling on description length, applied after ``describe``."""
+
+    response_format: Literal["content", "content_and_artifact"] = "content"
+    """``"content_and_artifact"`` also returns the raw SDK result on the ToolMessage."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     @model_validator(mode="before")
@@ -357,6 +486,7 @@ class AutoToolWrapper(BaseToolkit):
 
     def _build_operations(self) -> list[AutoTool]:
         operations: list[AutoTool] = []
+        unshortened: list[str] = []
 
         for func_name in dir(self.client):
             if func_name.startswith("_"):
@@ -368,7 +498,28 @@ class AutoToolWrapper(BaseToolkit):
                     continue
             except Exception:  # noqa: BLE001 - properties may raise on access
                 continue
-            operations.append(AutoTool.from_client(self.client, func_name))
+
+            tool = AutoTool.from_client(
+                self.client,
+                func_name,
+                fixed_args=self.fixed_args,
+                describe=self.describe,
+                max_description_length=self.max_description_length,
+                response_format=self.response_format,
+            )
+            if self.describe == "summary" and tool.args_schema is None:
+                unshortened.append(func_name)
+            operations.append(tool)
+
+        if unshortened:
+            logger.info(
+                "describe='summary' skipped for %d operation(s) whose arguments "
+                "could not be introspected, since the docstring is their only "
+                "argument reference: %s. Set max_description_length or pass a "
+                "callable to shorten them anyway.",
+                len(unshortened),
+                ", ".join(sorted(unshortened)[:5]),
+            )
 
         return operations
 

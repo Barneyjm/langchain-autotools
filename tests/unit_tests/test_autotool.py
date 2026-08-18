@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import pytest
+from langchain_core.tools import ToolException
 from pydantic import ValidationError
 
 from langchain_autotools import AutoTool, AutoToolWrapper, CrudControls
@@ -255,11 +256,6 @@ def test_legacy_json_payload_still_runs() -> None:
     assert json.loads(tool._run(thing_id=123))["response"]["id"] == 123
 
 
-def test_invalid_function_name() -> None:
-    tool = AutoTool(client=FakeSdk(), name="nope", description="nope")
-    assert tool._run() == "Invalid function name: nope"
-
-
 # --- crud controls ---------------------------------------------------------
 
 
@@ -325,3 +321,164 @@ def test_async_function_over_sync_interface_inside_loop() -> None:
         return tool_named("get_thing_async").invoke({"thing_id": 5})
 
     assert json.loads(asyncio.run(main()))["response"]["id"] == 5
+
+
+# --- error handling --------------------------------------------------------
+
+
+class BoomSdk:
+    def get_boom(self, thing_id: int) -> dict:
+        """Raises the way a real SDK does"""
+        raise PermissionError("AccessDenied: not authorized")
+
+
+def test_sdk_error_is_returned_to_the_agent() -> None:
+    """A failing SDK call becomes a tool result, not the end of the run."""
+    toolkit = AutoToolWrapper(client=BoomSdk())
+    result = tool_named("get_boom", toolkit).invoke({"thing_id": 1})
+    assert result == "PermissionError: AccessDenied: not authorized"
+
+
+def test_sdk_error_can_propagate() -> None:
+    """handle_tool_error=False re-raises, keeping the original as __cause__."""
+    toolkit = AutoToolWrapper(client=BoomSdk())
+    tool = tool_named("get_boom", toolkit)
+    tool.handle_tool_error = False
+    with pytest.raises(ToolException) as excinfo:
+        tool.invoke({"thing_id": 1})
+    assert isinstance(excinfo.value.__cause__, PermissionError)
+
+
+def test_missing_method_is_not_wrapped() -> None:
+    tool = AutoTool(client=FakeSdk(), name="nope", description="nope")
+    assert tool._run() == "Invalid function name: nope"
+
+
+# --- pinned arguments ------------------------------------------------------
+
+
+class TenantSdk:
+    def get_thing(self, thing_id: int, tenant: str = "default") -> dict:
+        """Gets Thing"""
+        return {"id": thing_id, "tenant": tenant}
+
+    def get_global(self, thing_id: int) -> dict:
+        """Takes no tenant"""
+        return {"id": thing_id}
+
+    def get_dynamic(self, **kwargs) -> dict:
+        """Accepts anything"""
+        return dict(kwargs)
+
+
+def test_fixed_args_are_hidden_from_the_schema() -> None:
+    toolkit = AutoToolWrapper(client=TenantSdk(), fixed_args={"tenant": "acme"})
+    schema = tool_named("get_thing", toolkit).args_schema.model_json_schema()
+    assert list(schema["properties"]) == ["thing_id"]
+
+
+def test_fixed_args_are_applied() -> None:
+    toolkit = AutoToolWrapper(client=TenantSdk(), fixed_args={"tenant": "acme"})
+    result = json.loads(tool_named("get_thing", toolkit).invoke({"thing_id": 1}))
+    assert result["tenant"] == "acme"
+
+
+def test_fixed_args_win_over_model_supplied_values() -> None:
+    toolkit = AutoToolWrapper(client=TenantSdk(), fixed_args={"tenant": "acme"})
+    tool = tool_named("get_thing", toolkit)
+    result = json.loads(tool._run(thing_id=1, tenant="evil"))
+    assert result["tenant"] == "acme"
+
+
+def test_fixed_args_skip_functions_that_cannot_accept_them() -> None:
+    """A toolkit-wide pin must not break operations without that parameter."""
+    toolkit = AutoToolWrapper(client=TenantSdk(), fixed_args={"tenant": "acme"})
+    assert tool_named("get_global", toolkit).fixed_args == {}
+    assert json.loads(tool_named("get_global", toolkit).invoke({"thing_id": 1})) == {
+        "id": 1
+    }
+
+
+def test_fixed_args_reach_kwargs_catchalls() -> None:
+    toolkit = AutoToolWrapper(client=TenantSdk(), fixed_args={"tenant": "acme"})
+    result = json.loads(tool_named("get_dynamic", toolkit).invoke({"thing_id": 1}))
+    assert result == {"thing_id": 1, "tenant": "acme"}
+
+
+# --- descriptions ----------------------------------------------------------
+
+
+class DocSdk:
+    def get_documented(self, thing_id: int) -> dict:
+        """Gets Thing.
+
+        A second paragraph with pagination trivia that a model does not need,
+        since the argument schema already describes the call.
+        """
+        return {"id": thing_id}
+
+    def get_dynamic(self, *args, **kwargs) -> dict:
+        """Gets Thing dynamically.
+
+        Parameters are documented only here: pass thing_id.
+        """
+        return {}
+
+
+def test_summary_uses_the_leading_paragraph() -> None:
+    toolkit = AutoToolWrapper(client=DocSdk(), describe="summary")
+    assert tool_named("get_documented", toolkit).description == "Gets Thing."
+
+
+def test_summary_is_skipped_without_a_schema() -> None:
+    """The docstring is the only argument reference for dynamic signatures."""
+    toolkit = AutoToolWrapper(client=DocSdk(), describe="summary")
+    description = tool_named("get_dynamic", toolkit).description
+    assert "documented only here" in description
+
+
+def test_max_description_length_always_applies() -> None:
+    toolkit = AutoToolWrapper(client=DocSdk(), max_description_length=20)
+    for tool in toolkit.get_tools():
+        assert len(tool.description) <= 23  # 20 plus the ellipsis
+    assert tool_named("get_dynamic", toolkit).description.endswith("...")
+
+
+def test_describe_accepts_a_callable() -> None:
+    toolkit = AutoToolWrapper(
+        client=DocSdk(), describe=lambda func, name: f"call {name}"
+    )
+    assert tool_named("get_dynamic", toolkit).description == "call get_dynamic"
+
+
+# --- artifacts -------------------------------------------------------------
+
+
+def test_content_and_artifact_returns_the_raw_result() -> None:
+    toolkit = AutoToolWrapper(client=FakeSdk(), response_format="content_and_artifact")
+    tool = tool_named("get_thing", toolkit)
+    message = tool.invoke(
+        {"name": "get_thing", "args": {"thing_id": 3}, "id": "1", "type": "tool_call"}
+    )
+    assert message.content == json.dumps({"status": 200, "response": {"id": 3}})
+    assert message.artifact == {"status": 200, "response": {"id": 3}}
+
+
+def test_content_and_artifact_drains_generators_once() -> None:
+    toolkit = AutoToolWrapper(client=FakeSdk(), response_format="content_and_artifact")
+    tool = tool_named("get_things_generator", toolkit)
+    message = tool.invoke(
+        {
+            "name": "get_things_generator",
+            "args": {"start_id": 100, "count": 3},
+            "id": "1",
+            "type": "tool_call",
+        }
+    )
+    assert isinstance(message.artifact, list)
+    assert len(message.artifact) == 3
+    assert json.loads(message.content) == message.artifact
+
+
+def test_default_response_format_is_a_string() -> None:
+    assert isinstance(tool_named("get_thing").invoke({"thing_id": 1}), str)

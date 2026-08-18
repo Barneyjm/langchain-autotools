@@ -2,6 +2,23 @@
 
 ## [0.1.0] - 2026-08-18
 
+### Added
+- **Description budget.** `describe="summary"` keeps only a docstring's leading
+  paragraph and `max_description_length` caps it outright, for SDKs whose docstrings
+  dominate the prompt (49 S3 tools carry ~128k tokens of description by default).
+  `describe` also accepts a `(func, name)` callable. `"summary"` is skipped for
+  operations whose arguments could not be introspected, since their docstring is the
+  only argument reference; an explicit cap or callable always applies.
+- **Pinned arguments.** `fixed_args` supplies values the model never sees or chooses.
+  They are removed from the `args_schema`, merged in at call time, and only applied to
+  operations that can accept them.
+- **Errors reach the agent.** SDK exceptions are re-raised as `ToolException` and
+  returned as the tool result by default, so an agent can read the failure and adapt
+  rather than the run ending. `handle_tool_error=False` restores propagation; the
+  original exception is preserved as `__cause__`.
+- **Raw results.** `response_format="content_and_artifact"` returns the materialized
+  Python object alongside the JSON string.
+
 ### Changed
 - **LangChain 1.x.** The package now targets `langchain-core >= 1.0` and depends on
   `langchain-core` directly rather than the full `langchain` meta-package.

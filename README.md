@@ -127,7 +127,72 @@ print(result["messages"][-1].content)
 
 _NOTE:_ If your SDK has many callable functions, your tool list could exceed your model's
 context length. Use `CrudControls` pattern matching to limit the tools your agent has
-access to.
+access to -- and see [Controlling description size](#controlling-description-size), which
+is usually the larger cost of the two.
+
+## Controlling description size
+
+Descriptions come from the wrapped function's docstring, and some SDKs write essays.
+Wrapping `boto3`'s S3 client with `read_list=["get_*", "list_*"]` produces 49 tools
+carrying **~128,000 tokens** of description between them -- `get_object` alone is ~9,000.
+The tool *count* is rarely the context problem; the docstrings are.
+
+```python
+# leading paragraph only
+toolkit = AutoToolWrapper(client=sdk, describe="summary")
+
+# hard ceiling, applied after `describe`
+toolkit = AutoToolWrapper(client=sdk, max_description_length=1500)
+
+# full control
+toolkit = AutoToolWrapper(client=sdk, describe=lambda func, name: my_summary(func))
+```
+
+`describe="summary"` is deliberately skipped for operations whose arguments could not be
+introspected -- for a dynamic SDK the docstring is the *only* record of what the call
+accepts, and trimming it would leave the model with no way to know `get_object` takes a
+`Bucket` and a `Key`. The toolkit logs which operations it skipped and why. An explicit
+`max_description_length` or a callable is always applied: both are a deliberate
+instruction, so they override the guard.
+
+On the S3 example above, a cap of 1500 gives ~17,800 tokens, and a first-paragraph
+callable gives ~1,050 -- with `get_object` reading `Retrieves an object from Amazon S3.`
+
+## Pinned arguments
+
+`fixed_args` supplies values the model never chooses and never sees. They are stripped
+from the `args_schema` and merged in at call time, overriding anything the model sent:
+
+```python
+toolkit = AutoToolWrapper(client=s3, fixed_args={"Bucket": "my-scoped-bucket"})
+```
+
+A pin is only applied to operations that can accept it -- one that takes no `Bucket` is
+left alone rather than being called with an argument it would reject.
+
+## Errors
+
+An SDK exception is re-raised as a `ToolException` and, by default, handed back to the
+agent as the tool's result (`"PermissionError: AccessDenied: not authorized"`) so it can
+read the failure and adapt instead of the run ending. Set `handle_tool_error=False` on a
+tool to let it propagate; the original exception is kept as `__cause__`.
+
+## Raw results
+
+Tools return a JSON string. To also get the underlying Python object without re-parsing,
+ask for an artifact:
+
+```python
+toolkit = AutoToolWrapper(client=sdk, response_format="content_and_artifact")
+
+message = tool.invoke(
+    {"name": "get_thing", "args": {"thing_id": 3}, "id": "1", "type": "tool_call"}
+)
+message.content   # '{"status": 200, "response": {"id": 3}}'  -- what the model sees
+message.artifact  # {'status': 200, 'response': {'id': 3}}    -- the real object
+```
+
+Generators are drained once, so the artifact is the materialized list.
 
 ## Async
 
