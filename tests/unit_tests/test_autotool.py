@@ -430,11 +430,10 @@ def test_summary_uses_the_leading_paragraph() -> None:
     assert tool_named("get_documented", toolkit).description == "Gets Thing."
 
 
-def test_summary_is_skipped_without_a_schema() -> None:
-    """The docstring is the only argument reference for dynamic signatures."""
+def test_summary_applies_without_a_schema() -> None:
+    """Summary trims dynamic signatures too, losing their only arg reference."""
     toolkit = AutoToolWrapper(client=DocSdk(), describe="summary")
-    description = tool_named("get_dynamic", toolkit).description
-    assert "documented only here" in description
+    assert tool_named("get_dynamic", toolkit).description == "Gets Thing dynamically."
 
 
 def test_max_description_length_always_applies() -> None:

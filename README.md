@@ -148,15 +148,15 @@ toolkit = AutoToolWrapper(client=sdk, max_description_length=1500)
 toolkit = AutoToolWrapper(client=sdk, describe=lambda func, name: my_summary(func))
 ```
 
-`describe="summary"` is deliberately skipped for operations whose arguments could not be
-introspected -- for a dynamic SDK the docstring is the *only* record of what the call
-accepts, and trimming it would leave the model with no way to know `get_object` takes a
-`Bucket` and a `Key`. The toolkit logs which operations it skipped and why. An explicit
-`max_description_length` or a callable is always applied: both are a deliberate
-instruction, so they override the guard.
+On the S3 example above, `describe="summary"` gives ~1,050 tokens -- a 99.2% cut -- with
+`get_object` reading `Retrieves an object from Amazon S3.` A cap of 1500 gives ~17,800.
 
-On the S3 example above, a cap of 1500 gives ~17,800 tokens, and a first-paragraph
-callable gives ~1,050 -- with `get_object` reading `Retrieves an object from Amazon S3.`
+_Watch out:_ for a **dynamic** SDK (see [Dynamic SDKs](#dynamic-sdks)) no `args_schema`
+could be derived, so the docstring is the only record of what a call accepts. Trimming it
+takes that away -- with `describe="summary"`, nothing tells the model that `get_object`
+needs a `Bucket` and a `Key`. Models often know popular SDKs well enough to manage, and
+`fixed_args` can supply the rest, but test it before trusting it. SDKs with real
+signatures are unaffected: their schema carries the arguments.
 
 ## Pinned arguments
 

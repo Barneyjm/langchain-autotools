@@ -169,16 +169,14 @@ def _describe(
     *,
     style: DescriptionStyle | Callable[[Any, str], str] = "full",
     max_length: int | None = None,
-    may_shorten: bool = True,
 ) -> str:
     """Build a tool description from the wrapped function.
 
     ``style`` is ``"full"`` (the whole docstring), ``"summary"`` (its leading
-    paragraph), or a callable taking ``(func, name)``. ``may_shorten`` is
-    ``False`` for functions whose arguments could not be introspected -- their
-    docstring is the only record of what they accept, so ``"summary"`` is
-    skipped for them. An explicit ``max_length`` is always honoured, and a
-    callable is always applied: both are a deliberate instruction.
+    paragraph), or a callable taking ``(func, name)``. Note that for a dynamic
+    SDK -- one whose signatures are ``(*args, **kwargs)``, so no ``args_schema``
+    could be derived -- the docstring is the only record of what a call accepts,
+    and shortening it takes that reference away from the model.
     """
     if callable(style):
         description = style(func, name)
@@ -186,7 +184,7 @@ def _describe(
         doc = inspect.getdoc(func)
         if doc and doc.strip():
             description = doc.strip()
-            if style == "summary" and may_shorten:
+            if style == "summary":
                 description = _first_paragraph(description) or description
         else:
             try:
@@ -318,14 +316,7 @@ class AutoTool(BaseTool):
         kwargs.setdefault("args_schema", args_schema)
         kwargs.setdefault(
             "description",
-            _describe(
-                func,
-                name,
-                style=describe,
-                max_length=max_description_length,
-                # Without a schema the docstring is the only argument reference.
-                may_shorten=args_schema is not None,
-            ),
+            _describe(func, name, style=describe, max_length=max_description_length),
         )
         return cls(client=client, name=name, fixed_args=pinned, **kwargs)
 
@@ -486,7 +477,6 @@ class AutoToolWrapper(BaseToolkit):
 
     def _build_operations(self) -> list[AutoTool]:
         operations: list[AutoTool] = []
-        unshortened: list[str] = []
 
         for func_name in dir(self.client):
             if func_name.startswith("_"):
@@ -499,26 +489,15 @@ class AutoToolWrapper(BaseToolkit):
             except Exception:  # noqa: BLE001 - properties may raise on access
                 continue
 
-            tool = AutoTool.from_client(
-                self.client,
-                func_name,
-                fixed_args=self.fixed_args,
-                describe=self.describe,
-                max_description_length=self.max_description_length,
-                response_format=self.response_format,
-            )
-            if self.describe == "summary" and tool.args_schema is None:
-                unshortened.append(func_name)
-            operations.append(tool)
-
-        if unshortened:
-            logger.info(
-                "describe='summary' skipped for %d operation(s) whose arguments "
-                "could not be introspected, since the docstring is their only "
-                "argument reference: %s. Set max_description_length or pass a "
-                "callable to shorten them anyway.",
-                len(unshortened),
-                ", ".join(sorted(unshortened)[:5]),
+            operations.append(
+                AutoTool.from_client(
+                    self.client,
+                    func_name,
+                    fixed_args=self.fixed_args,
+                    describe=self.describe,
+                    max_description_length=self.max_description_length,
+                    response_format=self.response_format,
+                )
             )
 
         return operations
