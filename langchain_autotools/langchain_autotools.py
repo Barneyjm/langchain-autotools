@@ -26,7 +26,14 @@ from langchain_core.callbacks import (
     CallbackManagerForToolRun,
 )
 from langchain_core.tools import BaseTool, BaseToolkit, ToolException
-from pydantic import BaseModel, ConfigDict, PrivateAttr, create_model, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    create_model,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +41,9 @@ CRUD_TYPES = ("create", "read", "update", "delete")
 
 #: How a tool description is built from the wrapped function.
 DescriptionStyle = Literal["full", "summary"]
+
+#: Pattern list backing each matcher. ``exclude`` is a veto, not a verb.
+_PATTERN_FIELDS = {crud: f"{crud}_list" for crud in CRUD_TYPES} | {"exclude": "exclude"}
 
 # Default CRUD toggles: read-only unless the caller opts in.
 AUTOTOOL_CRUD_CONTROLS_CREATE = False
@@ -60,9 +70,10 @@ class CrudControls(BaseModel):
     """Controls which SDK functions are exposed, grouped by CRUD verb.
 
     Each verb has an on/off switch and a list of patterns. A function is exposed
-    when its name matches a pattern belonging to an enabled verb. Patterns may be
-    globs (``"get_thing*"``) or regexes (``r"^get_thing_\\w+$"``); the style is
-    detected per pattern, so the two can be mixed freely in one list.
+    when its name matches a pattern belonging to an enabled verb and no pattern in
+    ``exclude``. Patterns may be globs (``"get_thing*"``) or regexes
+    (``r"^get_thing_\\w+$"``); the style is detected per pattern, so the two can be
+    mixed freely in one list.
     """
 
     create: bool = AUTOTOOL_CRUD_CONTROLS_CREATE
@@ -73,6 +84,9 @@ class CrudControls(BaseModel):
     update_list: list[str] = AUTOTOOL_CRUD_CONTROLS_UPDATE_LIST
     delete: bool = AUTOTOOL_CRUD_CONTROLS_DELETE
     delete_list: list[str] = AUTOTOOL_CRUD_CONTROLS_DELETE_LIST
+
+    exclude: list[str] = []
+    """Patterns vetoed regardless of verb, so wildcards can stay broad."""
 
     # Per-instance cache; never share compiled patterns between instances.
     _compiled_patterns: dict[str, dict[str, list[Pattern | str]]] = PrivateAttr(
@@ -102,11 +116,11 @@ class CrudControls(BaseModel):
         """Compile the pattern lists for every CRUD verb."""
         self._compiled_patterns.clear()
 
-        for crud_type in CRUD_TYPES:
+        for key, field in _PATTERN_FIELDS.items():
             regex_patterns: list[Pattern] = []
             glob_patterns: list[str] = []
 
-            for pattern in getattr(self, f"{crud_type}_list", []) or []:
+            for pattern in getattr(self, field, []) or []:
                 if not isinstance(pattern, str):
                     continue
                 if self._is_regex_pattern(pattern):
@@ -120,28 +134,46 @@ class CrudControls(BaseModel):
                 else:
                     glob_patterns.append(pattern)
 
-            self._compiled_patterns[crud_type] = {
+            self._compiled_patterns[key] = {
                 "regex": regex_patterns,
                 "glob": glob_patterns,
             }
 
-    def matches_pattern(self, func_name: str, crud_type: str) -> bool:
-        """Return ``True`` if ``func_name`` is allowed under ``crud_type``."""
-        if not getattr(self, crud_type, False):
-            return False
-
+    def _matches(self, func_name: str, key: str) -> bool:
         if not self._compiled_patterns:
             self.compile_patterns()
 
-        patterns = self._compiled_patterns.get(crud_type, {"regex": [], "glob": []})
+        patterns = self._compiled_patterns.get(key, {"regex": [], "glob": []})
 
         if any(pattern.match(func_name) for pattern in patterns["regex"]):
             return True
         return any(fnmatch(func_name, pattern) for pattern in patterns["glob"])
 
+    def matches_pattern(self, func_name: str, crud_type: str) -> bool:
+        """Return ``True`` if ``func_name`` is allowed under ``crud_type``."""
+        if not getattr(self, crud_type, False):
+            return False
+        return self._matches(func_name, crud_type)
+
+    def excludes(self, func_name: str) -> bool:
+        """Return ``True`` if ``func_name`` is vetoed by an ``exclude`` pattern."""
+        return self._matches(func_name, "exclude")
+
+    def matched_verb(self, func_name: str) -> str | None:
+        """Return the CRUD verb that exposes ``func_name``, if any.
+
+        When a name matches under more than one verb the first in ``CRUD_TYPES``
+        order wins, so the reported verb is stable across runs.
+        """
+        if self.excludes(func_name):
+            return None
+        return next(
+            (c for c in CRUD_TYPES if self.matches_pattern(func_name, c)), None
+        )
+
     def allows(self, func_name: str) -> bool:
-        """Return ``True`` if ``func_name`` matches any enabled CRUD verb."""
-        return any(self.matches_pattern(func_name, crud) for crud in CRUD_TYPES)
+        """Return ``True`` if ``func_name`` matches an enabled verb and no veto."""
+        return self.matched_verb(func_name) is not None
 
 
 def _unwrap_client(client: Any) -> Any:
@@ -198,6 +230,48 @@ def _describe(
     return description
 
 
+_GOOGLE_ARGS_HEADER = re.compile(r"^\s*(Args|Arguments|Parameters)\s*:\s*$")
+_GOOGLE_PARAM = re.compile(r"^\s*(\*{0,2}\w+)\s*(\([^)]*\))?\s*:\s*(.*)$")
+_SPHINX_PARAM = re.compile(r"^\s*:param\s+(?:[\w\[\], .]+\s+)?(\w+)\s*:\s*(.*)$")
+
+
+def _parse_param_docs(doc: str) -> dict[str, str]:
+    """Pull per-parameter text out of a docstring.
+
+    Understands Google style (an ``Args:`` block) and Sphinx style
+    (``:param name: ...``), which between them cover most hand-written SDKs.
+    Unrecognised layouts simply yield nothing.
+    """
+    params: dict[str, str] = {}
+
+    for line in doc.split("\n"):
+        match = _SPHINX_PARAM.match(line)
+        if match and match.group(2).strip():
+            params[match.group(1)] = match.group(2).strip()
+
+    lines = doc.split("\n")
+    for index, line in enumerate(lines):
+        if not _GOOGLE_ARGS_HEADER.match(line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        current: str | None = None
+        for body in lines[index + 1 :]:
+            if not body.strip():
+                continue
+            body_indent = len(body) - len(body.lstrip())
+            if body_indent <= indent:
+                break
+            match = _GOOGLE_PARAM.match(body)
+            if match and match.group(3).strip():
+                current = match.group(1).lstrip("*")
+                params.setdefault(current, match.group(3).strip())
+            elif current:
+                params[current] = f"{params[current]} {body.strip()}".strip()
+        break
+
+    return params
+
+
 def _build_args_schema(
     func: Any, name: str, exclude: Iterable[str] = ()
 ) -> type[BaseModel] | None:
@@ -218,6 +292,7 @@ def _build_args_schema(
     fields: dict[str, tuple[Any, Any]] = {}
     accepts_var_kwargs = False
     excluded = set(exclude)
+    param_docs = _parse_param_docs(inspect.getdoc(func) or "")
 
     for param_name, param in signature.parameters.items():
         if param_name in _FILTERED_PARAMS or param_name in excluded:
@@ -232,6 +307,8 @@ def _build_args_schema(
         if annotation is inspect.Parameter.empty or isinstance(annotation, str):
             annotation = Any
         default = ... if param.default is inspect.Parameter.empty else param.default
+        if param_name in param_docs:
+            default = Field(default, description=param_docs[param_name])
         fields[param_name] = (annotation, default)
 
     if not fields and accepts_var_kwargs:
@@ -281,6 +358,12 @@ class AutoTool(BaseTool):
     client: Any
     name: str
     description: str
+    func_name: str = ""
+    """SDK method to call. Defaults to ``name``; differs when a prefix is set."""
+
+    max_result_length: int | None = None
+    """Cap on serialized result size. Truncation affects content, never artifacts."""
+
     fixed_args: dict[str, Any] = {}
     """Arguments pinned by the caller: merged into every call, hidden from the model."""
 
@@ -306,6 +389,7 @@ class AutoTool(BaseTool):
         fixed_args: dict[str, Any] | None = None,
         describe: DescriptionStyle | Callable[[Any, str], str] = "full",
         max_description_length: int | None = None,
+        prefix: str = "",
         **kwargs: Any,
     ) -> AutoTool:
         """Build a tool for ``client.<name>``, inferring schema and description."""
@@ -318,12 +402,18 @@ class AutoTool(BaseTool):
             "description",
             _describe(func, name, style=describe, max_length=max_description_length),
         )
-        return cls(client=client, name=name, fixed_args=pinned, **kwargs)
+        return cls(
+            client=client,
+            name=f"{prefix}{name}",
+            func_name=name,
+            fixed_args=pinned,
+            **kwargs,
+        )
 
     @property
     def func(self) -> Any:
         """The bound SDK callable this tool wraps."""
-        return getattr(self.client, self.name)
+        return getattr(self.client, self.func_name or self.name)
 
     def _coerce_input(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
         """Support the legacy single-payload call style alongside kwargs.
@@ -352,11 +442,47 @@ class AutoTool(BaseTool):
             return list(result)
         return result
 
+    def _truncate(self, content: str, result: Any) -> str:
+        """Trim an oversized result, saying plainly what was dropped.
+
+        A list is cut on an item boundary so the kept portion is still valid
+        JSON; anything else is cut on a character boundary. Either way the
+        marker names the amount omitted, so the model can tell the difference
+        between "that is all of it" and "there is more".
+        """
+        limit = self.max_result_length
+        if limit is None or len(content) <= limit:
+            return content
+
+        if isinstance(result, list) and result:
+            used, kept = 2, 0  # the enclosing brackets
+            for item in result:
+                size = len(json.dumps(item, default=str)) + (1 if kept else 0)
+                if used + size > limit:
+                    break
+                used += size
+                kept += 1
+            omitted = len(result) - kept
+            if omitted:
+                return (
+                    json.dumps(result[:kept], default=str)
+                    + f"\n\n[truncated: {omitted:,} of {len(result):,} items omitted."
+                    " Narrow the request or raise max_result_length.]"
+                )
+
+        omitted = len(content) - limit
+        return (
+            content[:limit]
+            + f"\n\n[truncated: {omitted:,} of {len(content):,} characters omitted."
+            " Narrow the request or raise max_result_length.]"
+        )
+
     def _format(self, result: Any) -> str | tuple[str, Any]:
         """Render the SDK result per ``response_format``."""
         result = self._materialize(result)
-        content = json.dumps(result, default=str)
+        content = self._truncate(json.dumps(result, default=str), result)
         if self.response_format == "content_and_artifact":
+            # The artifact is for code, which has no context window: keep it whole.
             return content, result
         return content
 
@@ -374,7 +500,7 @@ class AutoTool(BaseTool):
         try:
             func = self.func
         except AttributeError:
-            return f"Invalid function name: {self.name}"
+            return f"Invalid function name: {self.func_name or self.name}"
 
         args, kwargs = self._prepare_call(args, kwargs)
         try:
@@ -394,7 +520,7 @@ class AutoTool(BaseTool):
         try:
             func = self.func
         except AttributeError:
-            return f"Invalid function name: {self.name}"
+            return f"Invalid function name: {self.func_name or self.name}"
 
         args, kwargs = self._prepare_call(args, kwargs)
         try:
@@ -462,6 +588,12 @@ class AutoToolWrapper(BaseToolkit):
     response_format: Literal["content", "content_and_artifact"] = "content"
     """``"content_and_artifact"`` also returns the raw SDK result on the ToolMessage."""
 
+    max_result_length: int | None = None
+    """Cap on serialized result size, so one large call can't exhaust the context."""
+
+    prefix: str = ""
+    """Prepended to every tool name, to keep two wrapped SDKs from colliding."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     @model_validator(mode="before")
@@ -497,6 +629,14 @@ class AutoToolWrapper(BaseToolkit):
                     describe=self.describe,
                     max_description_length=self.max_description_length,
                     response_format=self.response_format,
+                    max_result_length=self.max_result_length,
+                    prefix=self.prefix,
+                    # Keep the verb that exposed this operation, so callers can
+                    # gate destructive tools without re-deriving the match.
+                    metadata={
+                        "crud": self.crud_controls.matched_verb(func_name),
+                        "sdk_function": func_name,
+                    },
                 )
             )
 

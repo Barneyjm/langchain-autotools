@@ -3,6 +3,22 @@
 ## [0.1.0] - 2026-08-18
 
 ### Added
+- **Result truncation.** `max_result_length` caps what a call returns before it reaches
+  the model -- lists cut on an item boundary so the kept portion stays valid JSON,
+  everything else on a character boundary, both ending in a marker naming what was
+  dropped. Artifacts keep the whole result. One realistic list call measured ~222k
+  tokens, and it lands mid-run where the agent cannot recover.
+- **Exclude patterns.** `CrudControls(exclude=[...])` vetoes matches after the verb
+  lists, so wildcards can stay broad. `boto3` clients need it: `get_paginator` and
+  `get_waiter` match `get_*` and return object reprs when called.
+- **CRUD metadata.** Tools carry `metadata["crud"]` (the verb that exposed them) and
+  `metadata["sdk_function"]`, so destructive operations can be routed to
+  `HumanInTheLoopMiddleware` or an approval gate without re-deriving the match.
+- **Name prefixes.** `prefix` renames tools so two wrapped SDKs don't both expose
+  `get_object`; dispatch still uses the underlying method name.
+- **Argument documentation.** Per-parameter docstring text (Google `Args:` blocks and
+  Sphinx `:param name:`) becomes the schema field's description, and survives
+  `describe="summary"`.
 - **Description budget.** `describe="summary"` keeps only a docstring's leading
   paragraph and `max_description_length` caps it outright, for SDKs whose docstrings
   dominate the prompt (49 S3 tools carry ~128k tokens of description by default).

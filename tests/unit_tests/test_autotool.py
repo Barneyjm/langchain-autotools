@@ -481,3 +481,217 @@ def test_content_and_artifact_drains_generators_once() -> None:
 
 def test_default_response_format_is_a_string() -> None:
     assert isinstance(tool_named("get_thing").invoke({"thing_id": 1}), str)
+
+
+# --- exclude patterns ------------------------------------------------------
+
+
+def test_exclude_vetoes_a_wildcard_match() -> None:
+    """Wildcards stay broad; exclude drops the individual bad matches."""
+    controls = CrudControls(
+        read=True, read_list=["get_*"], exclude=["get_paginator", "get_waiter"]
+    )
+    assert controls.allows("get_object")
+    assert not controls.allows("get_paginator")
+    assert not controls.allows("get_waiter")
+
+
+def test_exclude_accepts_globs_and_regexes() -> None:
+    controls = CrudControls(read=True, read_list=["get_*"], exclude=["*_internal"])
+    assert not controls.allows("get_thing_internal")
+    assert controls.allows("get_thing")
+
+    controls = CrudControls(read=True, read_list=["get_*"], exclude=[r"^get_\d+$"])
+    assert not controls.allows("get_1")
+    assert controls.allows("get_thing")
+
+
+def test_exclude_keeps_operations_out_of_the_toolkit() -> None:
+    toolkit = AutoToolWrapper(
+        client=FakeSdk(),
+        crud_controls=CrudControls(
+            read=True, read_list=["get_*"], exclude=["get_things*"]
+        ),
+    )
+    names = [tool.name for tool in toolkit.get_tools()]
+    assert "get_thing" in names
+    assert "get_things" not in names
+    assert "get_things_generator" not in names
+
+
+def test_no_exclude_by_default() -> None:
+    assert CrudControls().allows("get_thing")
+
+
+# --- crud metadata ---------------------------------------------------------
+
+
+def test_tools_record_the_matched_verb() -> None:
+    toolkit = AutoToolWrapper(client=FakeSdk(), crud_controls=crud_controls)
+    verbs = {tool.name: tool.metadata["crud"] for tool in toolkit.get_tools()}
+    assert verbs["get_thing"] == "read"
+    assert verbs["create_thing"] == "create"
+    assert verbs["update_thing"] == "update"
+    assert verbs["delete_thing"] == "delete"
+
+
+def test_metadata_records_the_sdk_function() -> None:
+    toolkit = AutoToolWrapper(client=FakeSdk(), prefix="fake_")
+    tool = tool_named("fake_get_thing", toolkit)
+    assert tool.metadata["sdk_function"] == "get_thing"
+
+
+def test_matched_verb_is_stable_across_overlapping_lists() -> None:
+    controls = CrudControls(
+        read=True, read_list=["get_*"], delete=True, delete_list=["get_*"]
+    )
+    assert controls.matched_verb("get_thing") == "read"
+
+
+def test_destructive_tools_can_be_selected() -> None:
+    """The use case the metadata exists for: gating write operations."""
+    toolkit = AutoToolWrapper(client=FakeSdk(), crud_controls=crud_controls)
+    destructive = [
+        tool.name
+        for tool in toolkit.get_tools()
+        if tool.metadata["crud"] in ("create", "update", "delete")
+    ]
+    assert set(destructive) == {
+        "create_thing",
+        "update_thing",
+        "post_thing",
+        "put_thing",
+        "delete_thing",
+    }
+
+
+# --- name prefix -----------------------------------------------------------
+
+
+def test_prefix_renames_tools_without_breaking_dispatch() -> None:
+    toolkit = AutoToolWrapper(client=FakeSdk(), prefix="fake_")
+    tool = tool_named("fake_get_thing", toolkit)
+    assert tool.func_name == "get_thing"
+    assert json.loads(tool.invoke({"thing_id": 7}))["response"]["id"] == 7
+
+
+def test_prefix_keeps_two_sdks_apart() -> None:
+    first = AutoToolWrapper(client=FakeSdk(), prefix="a_")
+    second = AutoToolWrapper(client=FakeSdk(), prefix="b_")
+    names = [t.name for t in first.get_tools()] + [t.name for t in second.get_tools()]
+    assert len(names) == len(set(names))
+
+
+def test_prefixed_missing_method_names_the_sdk_function() -> None:
+    tool = AutoTool(
+        client=FakeSdk(), name="fake_nope", func_name="nope", description="nope"
+    )
+    assert tool._run() == "Invalid function name: nope"
+
+
+# --- result truncation -----------------------------------------------------
+
+
+class BulkSdk:
+    def get_keys(self, count: int) -> list:
+        """Lists keys."""
+        return [{"Key": f"part-{i:05d}"} for i in range(count)]
+
+    def get_blob(self, size: int) -> dict:
+        """Gets one large record."""
+        return {"body": "x" * size}
+
+
+def test_list_results_truncate_on_an_item_boundary() -> None:
+    toolkit = AutoToolWrapper(client=BulkSdk(), max_result_length=300)
+    content = tool_named("get_keys", toolkit).invoke({"count": 1000})
+    body, marker = content.split("\n\n")
+    assert isinstance(json.loads(body), list)  # kept portion is still valid JSON
+    assert "of 1,000 items omitted" in marker
+
+
+def test_non_list_results_truncate_on_a_character_boundary() -> None:
+    toolkit = AutoToolWrapper(client=BulkSdk(), max_result_length=200)
+    content = tool_named("get_blob", toolkit).invoke({"size": 50_000})
+    assert "characters omitted" in content
+    assert len(content) < 400
+
+
+def test_results_under_the_limit_are_untouched() -> None:
+    toolkit = AutoToolWrapper(client=BulkSdk(), max_result_length=10_000)
+    content = tool_named("get_keys", toolkit).invoke({"count": 3})
+    assert json.loads(content) == [{"Key": f"part-{i:05d}"} for i in range(3)]
+
+
+def test_no_truncation_by_default() -> None:
+    toolkit = AutoToolWrapper(client=BulkSdk())
+    content = tool_named("get_keys", toolkit).invoke({"count": 500})
+    assert len(json.loads(content)) == 500
+
+
+def test_truncation_leaves_the_artifact_whole() -> None:
+    """Truncation protects the context window, not the calling code."""
+    toolkit = AutoToolWrapper(
+        client=BulkSdk(), max_result_length=200, response_format="content_and_artifact"
+    )
+    message = tool_named("get_keys", toolkit).invoke(
+        {"name": "get_keys", "args": {"count": 500}, "id": "1", "type": "tool_call"}
+    )
+    assert "items omitted" in message.content
+    assert len(message.artifact) == 500
+
+
+# --- argument descriptions -------------------------------------------------
+
+
+class DocumentedSdk:
+    def get_google(self, thing_id: int, verbose: bool = False) -> dict:
+        """Gets a thing.
+
+        Args:
+            thing_id: Identifier of the thing,
+                as issued by the registry.
+            verbose (bool): Include the full record.
+        """
+        return {}
+
+    def get_sphinx(self, thing_id: int) -> dict:
+        """Gets a thing.
+
+        :param int thing_id: Identifier of the thing.
+        """
+        return {}
+
+    def get_undocumented_params(self, thing_id: int) -> dict:
+        """No parameter docs here."""
+        return {}
+
+
+def _properties(toolkit: AutoToolWrapper, name: str) -> dict:
+    return tool_named(name, toolkit).args_schema.model_json_schema()["properties"]
+
+
+def test_google_style_arg_docs_reach_the_schema() -> None:
+    props = _properties(AutoToolWrapper(client=DocumentedSdk()), "get_google")
+    assert props["thing_id"]["description"] == (
+        "Identifier of the thing, as issued by the registry."
+    )
+    assert props["verbose"]["description"] == "Include the full record."
+
+
+def test_sphinx_style_arg_docs_reach_the_schema() -> None:
+    props = _properties(AutoToolWrapper(client=DocumentedSdk()), "get_sphinx")
+    assert props["thing_id"]["description"] == "Identifier of the thing."
+
+
+def test_missing_arg_docs_are_not_invented() -> None:
+    toolkit = AutoToolWrapper(client=DocumentedSdk())
+    props = _properties(toolkit, "get_undocumented_params")
+    assert "description" not in props["thing_id"]
+
+
+def test_arg_docs_survive_summarised_descriptions() -> None:
+    """Summary trims the description; the schema keeps the argument detail."""
+    toolkit = AutoToolWrapper(client=DocumentedSdk(), describe="summary")
+    assert tool_named("get_google", toolkit).description == "Gets a thing."
+    assert _properties(toolkit, "get_google")["thing_id"]["description"]
