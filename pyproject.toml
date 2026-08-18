@@ -1,6 +1,6 @@
 [project]
 name = "langchain-autotools"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automatic LangChain Tool and Toolkit creation from any Python SDK!"
 authors = [{ name = "James Barney", email = "james@southendsolutions.com" }]
 license = "MIT"
